@@ -11,6 +11,8 @@ from common_keys import *
 from tqdm import tqdm
 from pytorch_quantization import nn as quant_nn
 from pytorch_quantization import calib
+from pytorch_quantization.tensor_quant import QuantDescriptor
+from pytorch_quantization import quant_modules
 import tempfile
 
 
@@ -494,11 +496,8 @@ def ort_inference(model_file: str,
     return ort_outs
 
 
-def print_size_of_model(model):
-    temp_dir = tempfile.gettempdir()
-    torch.save(model.state_dict(), f"{temp_dir}/temp.p")
-    print('Size (MB):', os.path.getsize(f"{temp_dir}/temp.p") / 1e6)
-    os.remove(f"{temp_dir}/temp.p")
+def print_size_of_model(trt_file):
+    print('Size (MB):', os.path.getsize(trt_file) / 1e6)
 
 
 def collect_stats(model, data_loader, device, num_batches):
@@ -539,3 +538,34 @@ def compute_amax(model, torch_device, **kwargs):
                     module.load_calib_amax(**kwargs)
             print(F"{name:40}: {module}")
     model.to(torch_device)
+
+
+def prepare_quantization_model(calibration_type):
+    if calibration_type != CALIBRATION_MAX:
+        quant_desc_input = QuantDescriptor(calib_method=CALIBRATION_HISTOGRAM)
+        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+    else:
+        quant_desc_input = QuantDescriptor(calib_method=CALIBRATION_MAX, axis=None)
+        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantConvTranspose2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+
+    quant_modules.initialize()
+
+
+def implement_calibration(model, dataloader, device, calibration_type, calibration_batch_count):
+    quant_modules.deactivate()
+    model.eval()
+    # It is a bit slow since we collect histograms on CPU
+    with torch.no_grad():
+        collect_stats(model=model, data_loader=dataloader, device=device,
+                      num_batches=calibration_batch_count)
+        if PERCENTILE in calibration_type:
+            percentile_ratio = float(f"99.{calibration_type.split('_')[-1]}")
+            compute_amax(model, device,
+                         method=PERCENTILE,
+                         percentile=percentile_ratio)
+        else:
+            compute_amax(model, device,
+                         method=calibration_type)

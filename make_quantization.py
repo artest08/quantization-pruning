@@ -11,7 +11,9 @@ import os
 import argparse
 from common_keys import *
 from deployment_utils import save_onnx_model, onnx_to_tensorrt, \
-    initialize_tensorrt_model, tensorrt_inference, to_numpy, compute_amax, collect_stats
+    initialize_tensorrt_model, tensorrt_inference, to_numpy,\
+    prepare_quantization_model, implement_calibration, print_size_of_model
+
 from pytorch_quantization import nn as quant_nn
 from pytorch_quantization import calib
 from pytorch_quantization.tensor_quant import QuantDescriptor
@@ -40,43 +42,12 @@ def load_dataloader(batch_size, is_train=False):
     return dataloader
 
 
-def prepare_quantization_model(calibration_type):
-    if calibration_type != CALIBRATION_MAX:
-        quant_desc_input = QuantDescriptor(calib_method=CALIBRATION_HISTOGRAM)
-        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
-    else:
-        quant_desc_input = QuantDescriptor(calib_method=CALIBRATION_MAX, axis=None)
-        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantConvTranspose2d.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
-
-    quant_modules.initialize()
-
-
-def implement_calibration(model, dataloader, device, calibration_type, calibration_batch_count):
-    quant_modules.deactivate()
-    model.eval()
-    # It is a bit slow since we collect histograms on CPU
-    with torch.no_grad():
-        collect_stats(model=model, data_loader=dataloader, device=device,
-                      num_batches=calibration_batch_count)
-        if PERCENTILE in calibration_type:
-            percentile_ratio = float(f"99.{calibration_type.split('_')[-1]}")
-            compute_amax(model, device,
-                         method=PERCENTILE,
-                         percentile=percentile_ratio)
-        else:
-            compute_amax(model, device,
-                         method=calibration_type)
-
-
-def main_func(opset_version, precision, batch_size,
+def main_func(opset_version, precision, batch_size, inference_type, model,
               quantization_type=None,
               calibration_type=None,
               number_of_calibration_samples=None):
     resnet_models = resnet.__dict__
-    MODEL = "resnet18"
+    MODEL = model
     weight_file = "weights/"
     device = "cuda"
     batch_size = batch_size
@@ -101,57 +72,67 @@ def main_func(opset_version, precision, batch_size,
     prediction_prob = torch.zeros(batch_size, 10)
     dummy_outputs = {"out": prediction_prob}
 
-    if not os.path.isfile(onnx_file):
-        if quantization_mode:
-            prepare_quantization_model(calibration_type)
+    if inference_type == TENSORRT_INFERENCE:
+        if not os.path.isfile(onnx_file):
+            if quantization_mode:
+                prepare_quantization_model(calibration_type)
 
+            model = resnet_models[MODEL](pretrained=False, num_classes=10)
+            model.load_state_dict(torch.load(f"./cifar10_models/state_dicts/{MODEL}.pt"))
+            model.to(device)
+            model.eval()
+
+            if quantization_mode:
+                implement_calibration(model=model, dataloader=train_loader, device=device,
+                                      calibration_type=calibration_type,
+                                      calibration_batch_count=number_of_calibration_batch)
+
+            if quantization_mode:
+                quant_nn.TensorQuantizer.use_fb_fake_quant = True
+            save_onnx_model(inputs=dummy_image, outputs=dummy_outputs, model=model,
+                            onnx_file=onnx_file, opset_version=opset_version)
+
+        if not os.path.isfile(tensorrt_file):
+            onnx_to_tensorrt(onnx_file=onnx_file,
+                             tensorrt_file=tensorrt_file,
+                             precision=precision)
+            print_size_of_model(tensorrt_file)
+
+        context, bindings, device_input, device_tensorrt_outs, stream, host_tensorrt_outs = \
+            initialize_tensorrt_model(tensorrt_file=tensorrt_file,
+                                      image=to_numpy(dummy_image),
+                                      output_names=["out"],
+                                      outputs=dummy_outputs)
+
+    elif inference_type == TORCH_INFERENCE:
         model = resnet_models[MODEL](pretrained=False, num_classes=10)
         model.load_state_dict(torch.load("./cifar10_models/state_dicts/resnet18.pt"))
         model.to(device)
         model.eval()
 
-        if quantization_mode:
-            implement_calibration(model=model, dataloader=train_loader, device=device,
-                                  calibration_type=calibration_type,
-                                  calibration_batch_count=number_of_calibration_batch)
-
-        if quantization_mode:
-            quant_nn.TensorQuantizer.use_fb_fake_quant = True
-        save_onnx_model(inputs=dummy_image, outputs=dummy_outputs, model=model,
-                        onnx_file=onnx_file, opset_version=opset_version)
-
-    if not os.path.isfile(tensorrt_file):
-        onnx_to_tensorrt(onnx_file=onnx_file,
-                         tensorrt_file=tensorrt_file,
-                         precision=precision)
-
-    context, bindings, device_input, device_tensorrt_outs, stream, host_tensorrt_outs = \
-        initialize_tensorrt_model(tensorrt_file=tensorrt_file,
-                                  image=to_numpy(dummy_image),
-                                  output_names=["out"],
-                                  outputs=dummy_outputs)
-
     accuracy_list = []
     time_list = []
     with torch.no_grad():
         for batch_index, (image, label) in enumerate(val_loader):
-            # Here Torch
-            # image = image.to("cuda")
-            # label = label.to("cuda")
-            # prediction_prob = model(image)
-            # prediction_prob = to_numpy(prediction_prob)
 
             start_time = time()
+            if inference_type == TENSORRT_INFERENCE:
+                tensorrt_inference(device_input=device_input,
+                                   context=context,
+                                   bindings=bindings,
+                                   device_tensorrt_outs=device_tensorrt_outs,
+                                   stream=stream,
+                                   image=image,
+                                   host_tensorrt_outs=host_tensorrt_outs)
 
-            tensorrt_inference(device_input=device_input,
-                               context=context,
-                               bindings=bindings,
-                               device_tensorrt_outs=device_tensorrt_outs,
-                               stream=stream,
-                               image=image,
-                               host_tensorrt_outs=host_tensorrt_outs)
+                prediction_prob = host_tensorrt_outs["out"]
 
-            prediction_prob = host_tensorrt_outs["out"]
+            elif inference_type == TORCH_INFERENCE:
+                image = image.to(device)
+                label = label.to(device)
+                prediction_prob = model(image)
+                prediction_prob = to_numpy(prediction_prob)
+
             predictions = prediction_prob.argmax(1)
             label = to_numpy(label)
 
@@ -163,9 +144,12 @@ def main_func(opset_version, precision, batch_size,
             accuracy_list.append(number_of_corrects / batch_size)
         accuracy = np.mean(accuracy_list)
         print(f"average accuracy is {accuracy}")
-        mean_inference_time = np.mean(time_list)
-        print(f"mean inference time is {mean_inference_time}")
-        print(tensorrt_file)
+        mean_inference_time = np.mean(time_list) * 1000
+        print(f"mean inference time is {mean_inference_time: 0.4f} ms")
+        if inference_type == TENSORRT_INFERENCE:
+            print(tensorrt_file)
+        else:
+            print("torch inference")
 
 
 if __name__ == "__main__":
@@ -176,6 +160,12 @@ if __name__ == "__main__":
                         choices=[FP32, FP16, INT8], required=True)
     parser.add_argument('--batch_size', type=int,
                         help='batch size of the overall scheme', default=16, required=False)
+    parser.add_argument('--inference_type',
+                        help='In order to decide whether tensorrt or torch inference', default=TENSORRT_INFERENCE,
+                        required=False, choices=[TORCH_INFERENCE, TENSORRT_INFERENCE])
+    parser.add_argument('--model',
+                        help='architecture model', default=RESNET18, required=False,
+                        choices=[RESNET18, RESNET34, RESNET50])
     parser.add_argument('--quantization_type', help='Quantization type, '
                                                     'which are post training quantization(ptq) or '
                                                     'quantization aware training (qat)',
@@ -191,7 +181,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    main_func(args.opset_version, args.precision, args.batch_size,
+    main_func(args.opset_version, args.precision, args.batch_size, inference_type=args.inference_type,
+              model=args.model,
               quantization_type=args.quantization_type,
               calibration_type=args.calibration_type,
               number_of_calibration_samples=args.number_of_calibration_samples)
