@@ -56,10 +56,10 @@ def main_func(opset_version, precision, batch_size, inference_type, model,
         number_of_calibration_batch = ceil(number_of_calibration_samples / batch_size)
         number_of_calibration_samples = batch_size * number_of_calibration_batch
         quantization_mode = True
-        naming = f"{MODEL}_{quantization_type}_{calibration_type}_ncs_{number_of_calibration_samples}_op{opset_version}"
+        naming = f"{MODEL}_{quantization_type}_{calibration_type}_ncs_{number_of_calibration_samples}_op{opset_version}_batchsize{batch_size}"
     else:
         quantization_mode = False
-        naming = f"{MODEL}_{precision}_op{opset_version}"
+        naming = f"{MODEL}_{precision}_op{opset_version}_batchsize{batch_size}"
 
     tensorrt_file = f"{weight_file}{naming}.{TENSORRT_EXTENSION}"
     onnx_file = f"{weight_file}{naming}.{ONNX_EXTENSION}"
@@ -129,7 +129,7 @@ def main_func(opset_version, precision, batch_size, inference_type, model,
 
             elif inference_type == TORCH_INFERENCE:
                 image = image.to(device)
-                label = label.to(device)
+                # label = label.to(device)
                 prediction_prob = model(image)
                 prediction_prob = to_numpy(prediction_prob)
 
